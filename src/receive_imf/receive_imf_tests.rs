@@ -5250,3 +5250,89 @@ async fn test_outgoing_unencrypted_chat_assignment() {
     let chat = alice.create_email_chat(bob).await;
     assert_eq!(received.chat_id, chat.id);
 }
+
+// Reproduce: Not fully downloaded message edit is lost #6806
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_edit_preserved_after_full_download() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let bob = tcm.bob().await;
+
+    // Step 1: Bob receives a large message from Alice, but only partially downloaded
+    let original_text = "This is a very long message that will be partially downloaded initially";
+    let large_message = format!(
+        "From: alice@example.org\n\
+         To: bob@example.net\n\
+         Subject: Large message\n\
+         Message-ID: <large-msg@example.org>\n\
+         Chat-Version: 1.0\n\
+         Date: Sun, 22 Mar 2020 22:37:57 +0000\n\
+         Content-Type: text/plain; charset=utf-8\n\
+         \n\
+         {original_text}\n"
+    );
+    let received_partial = receive_imf_from_inbox(
+        &bob,
+        "large-msg@example.org",
+        large_message.as_bytes(),
+        false,
+        Some(100000),
+    )
+    .await?
+    .context("not received partial message")?;
+
+    let partial_msg = Message::load_from_db(&bob, received_partial.msg_ids[0]).await?;
+    assert_eq!(partial_msg.download_state, DownloadState::Available);
+
+    // Step 2: Alice sends an edit message for the partially downloaded message
+    let edited_text = "This is the EDITED version of the long message";
+    let edit_message = format!(
+        "From: alice@example.org\n\
+         To: bob@example.net\n\
+         Subject: Re: Large message\n\
+         Message-ID: <edit-msg@example.org>\n\
+         Chat-Version: 1.0\n\
+         Chat-Edit: <large-msg@example.org>\n\
+         In-Reply-To: <large-msg@example.org>\n\
+         Date: Sun, 22 Mar 2020 22:38:57 +0000\n\
+         Content-Type: text/plain; charset=utf-8\n\
+         \n\
+         On 2020-03-22, alice@example.org wrote:\n\
+         > {original_text}\n\
+         {edited_text}\n"
+    );
+
+    let edited = receive_imf(&bob, edit_message.as_bytes(), false)
+        .await?
+        .unwrap();
+    let edited_msg = Message::load_from_db(&bob, edited.msg_ids[0]).await?;
+
+    // BUG: This assertion should pass but currently fails
+    // The edited text should be preserved, not replaced with original
+    assert_eq!(edited_msg.get_text(), edited_text, "Edit should be applied");
+    assert!(edited_msg.is_edited(), "Message should show as edited");
+
+    // Step 3: Now Bob downloads the full original message
+    // This should NOT overwrite the edited text
+    receive_imf_from_inbox(
+        &bob,
+        "large-msg@example.org",
+        large_message.as_bytes(),
+        false,
+        None, // Full download
+    )
+    .await?;
+
+    // Verify the edit is preserved after full download
+    let final_msg = Message::load_from_db(&bob, received_partial.msg_ids[0]).await?;
+
+    // BUG: This assertion should pass but currently fails
+    // The edited text should be preserved, not replaced with original
+    assert_eq!(
+        final_msg.get_text(),
+        edited_text,
+        "Edit should be preserved after full download, but original text was restored"
+    );
+    assert!(final_msg.is_edited(), "Message should still show as edited");
+
+    Ok(())
+}
